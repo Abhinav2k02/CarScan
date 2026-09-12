@@ -7,18 +7,32 @@ import android.os.SystemClock
 import java.io.Closeable
 
 /**
- * Runs stages 1 to 3 and produces the input manifest.
+ * Runs CarScan stages up to InputManifest.
  *
- * Both inputs are optional — video only, dashboard photo only, or both.
+ * VIDEO
+ *   -> frame extraction
+ *   -> MobileNetV3 classification
+ *   -> confidence filtering
+ *   -> sharpest frame per class
+ *   -> InputManifest
  *
- * Ordering matters: frames are decoded BEFORE the model loads, and the model is
- * released before the manifest is built. Holding a 571 MB model resident while
- * decoding video is what pushes the CPU path out of memory.
+ * DASHBOARD PHOTO
+ *   -> sharpness check
+ *   -> MobileNetV3 dashboard validation
+ *
+ * TYRE
+ *   -> presence is recorded in InputManifest for later processing
+ *
+ * OBD
+ *   -> parked for later
  */
 object PipelineRunner {
 
-    /** Dashboard photos below this Laplacian variance are too soft for OCR. */
+    /** Dashboard photos below this Laplacian variance are too soft for later OCR. */
     private const val DASHBOARD_MIN_SHARPNESS = 60.0
+
+    /** Predictions below this confidence become REJECT. */
+    private const val MIN_CLASSIFICATION_CONFIDENCE = 0.60f
 
     suspend fun buildManifest(
         context: Context,
@@ -32,9 +46,10 @@ object PipelineRunner {
 
         val startedAt = SystemClock.elapsedRealtime()
 
-        // ---- Stage 1: frame extraction (no model resident) ----
+        // Stage 1: Extract frames
         val frames = if (videoUri != null) {
             onStage("Extracting frames")
+
             FrameExtractor.extract(context, videoUri) { done, total ->
                 onStage("Extracting frames  $done / $total")
             }
@@ -42,100 +57,189 @@ object PipelineRunner {
             emptyList()
         }
 
-        // ---- Load the dashboard photo, keep it for classification ----
+        // Load dashboard image and measure quality
         var dashboardBitmap: Bitmap? = null
         var dashboardSharpness = 0.0
         var dashboardUsable = false
 
         if (dashboardUri != null) {
-            onStage("Checking photo quality")
-            dashboardBitmap = FrameExtractor.loadImage(context, dashboardUri)
-            if (dashboardBitmap != null) {
-                dashboardSharpness = FrameExtractor.sharpness(dashboardBitmap)
-                dashboardUsable = dashboardSharpness >= DASHBOARD_MIN_SHARPNESS
+            onStage("Checking dashboard photo quality")
+
+            dashboardBitmap = FrameExtractor.loadImage(
+                context,
+                dashboardUri
+            )
+
+            dashboardBitmap?.let { bitmap ->
+                dashboardSharpness = FrameExtractor.sharpness(bitmap)
+                dashboardUsable =
+                    dashboardSharpness >= DASHBOARD_MIN_SHARPNESS
             }
         }
 
-        // ---- Stage 2: load the model only now ----
-        onStage(
-            if (backend == null) "Loading model (auto)"
-            else "Loading model (${backend.name})"
-        )
+        // Stage 2: Load MobileNetV3
+        onStage("Loading MobileNetV3")
 
-        var clip: ClipViewClassifier? = null
+        var mobileNet: MobileNetV3ViewClassifier? = null
         var loadError: String? = null
+
         try {
-            clip = ClipViewClassifier.create(context, backend)
+            mobileNet = MobileNetV3ViewClassifier(context)
         } catch (e: OutOfMemoryError) {
-            loadError = "Out of memory loading the model"
+            loadError = "Out of memory loading MobileNetV3"
         } catch (e: Throwable) {
-            loadError = e.message
+            loadError = e.message ?: "Unable to load MobileNetV3"
         }
 
-        val engine: ViewClassifier = clip ?: HeuristicViewClassifier()
-        val requestedButUnavailable = backend != null && clip == null
+        // Existing fallback keeps the manifest screen usable during development.
+        val engine: ViewClassifier =
+            mobileNet ?: HeuristicViewClassifier()
 
         var inferenceMs = 0L
         var inferenceCount = 0
-        var classified: List<Pair<ExtractedFrame, Classification>> = emptyList()
+
+        var classified:
+            List<Pair<ExtractedFrame, Classification>> = emptyList()
+
         var dashboardClass: String? = null
         var dashboardConfidence = 0f
 
         try {
-            // ---- Classify video frames ----
+            // Stage 3A: Classify every extracted video frame
             if (frames.isNotEmpty()) {
-                onStage("Classifying views")
-                val results = ArrayList<Pair<ExtractedFrame, Classification>>(frames.size)
-                for ((i, frame) in frames.withIndex()) {
-                    onStage("Classifying views  ${i + 1} / ${frames.size}")
-                    val t0 = SystemClock.elapsedRealtime()
-                    val result = try {
-                        engine.classify(frame.bitmap, frame.sharpness)
+                onStage("Classifying video frames")
+
+                val results =
+                    ArrayList<Pair<ExtractedFrame, Classification>>(frames.size)
+
+                for ((index, frame) in frames.withIndex()) {
+                    onStage("MobileNetV3  ${index + 1} / ${frames.size}")
+
+                    val inferenceStart = SystemClock.elapsedRealtime()
+
+                    var result = try {
+                        engine.classify(
+                            frame.bitmap,
+                            frame.sharpness
+                        )
                     } catch (e: OutOfMemoryError) {
-                        loadError = "Out of memory during inference"
-                        Classification(ViewClass.REJECT, 0f)
+                        loadError =
+                            "Out of memory during MobileNetV3 inference"
+
+                        Classification(
+                            ViewClass.REJECT,
+                            0f
+                        )
+                    } catch (_: Throwable) {
+                        Classification(
+                            ViewClass.REJECT,
+                            0f
+                        )
                     }
-                    inferenceMs += SystemClock.elapsedRealtime() - t0
+
+                    inferenceMs +=
+                        SystemClock.elapsedRealtime() - inferenceStart
+
                     inferenceCount++
+
+                    if (
+                        result.viewClass != ViewClass.REJECT &&
+                        result.confidence < MIN_CLASSIFICATION_CONFIDENCE
+                    ) {
+                        result = Classification(
+                            ViewClass.REJECT,
+                            result.confidence
+                        )
+                    }
+
                     results.add(frame to result)
-                    if (loadError != null) break
+
+                    if (loadError != null) {
+                        break
+                    }
                 }
+
                 classified = results
             }
 
-            // ---- Validate the dashboard photo with the same model ----
+            // Stage 3B: Validate dashboard close-up
             val bitmap = dashboardBitmap
-            if (bitmap != null && loadError == null) {
+
+            if (
+                bitmap != null &&
+                loadError == null
+            ) {
                 onStage("Verifying dashboard photo")
-                val t0 = SystemClock.elapsedRealtime()
+
+                val inferenceStart = SystemClock.elapsedRealtime()
+
                 val result = try {
-                    engine.classify(bitmap, dashboardSharpness)
-                } catch (e: OutOfMemoryError) {
-                    Classification(ViewClass.REJECT, 0f)
+                    engine.classify(
+                        bitmap,
+                        dashboardSharpness
+                    )
+                } catch (_: Throwable) {
+                    Classification(
+                        ViewClass.REJECT,
+                        0f
+                    )
                 }
-                inferenceMs += SystemClock.elapsedRealtime() - t0
+
+                inferenceMs +=
+                    SystemClock.elapsedRealtime() - inferenceStart
+
                 inferenceCount++
+
                 dashboardClass = result.viewClass.label
                 dashboardConfidence = result.confidence
+
+                dashboardUsable =
+                    dashboardUsable &&
+                    result.viewClass == ViewClass.DASHBOARD &&
+                    result.confidence >= MIN_CLASSIFICATION_CONFIDENCE
             }
         } finally {
             (engine as? Closeable)?.let {
-                try { it.close() } catch (ignored: Exception) {}
+                try {
+                    it.close()
+                } catch (_: Exception) {
+                }
             }
-            try { dashboardBitmap?.recycle() } catch (ignored: Exception) {}
+
+            try {
+                dashboardBitmap?.recycle()
+            } catch (_: Exception) {
+            }
         }
 
-        val kept = classified.filter { it.second.viewClass != ViewClass.REJECT }
-        val rejectedCount = classified.size - kept.size
+        // Reject low-confidence / invalid frames
+        val kept = classified.filter {
+            it.second.viewClass != ViewClass.REJECT
+        }
 
-        // ---- Dedupe: sharpest frame per view class ----
-        if (kept.isNotEmpty()) onStage("Removing duplicates")
+        val rejectedCount =
+            classified.size - kept.size
+
+        // Dedupe: keep sharpest frame for each detected class.
+        if (kept.isNotEmpty()) {
+            onStage("Selecting best frames")
+        }
+
         val bestPerView = kept
-            .groupBy { it.second.viewClass }
-            .mapNotNull { (_, group) -> group.maxByOrNull { it.first.sharpness } }
-            .sortedBy { it.first.timestampMs }
+            .groupBy {
+                it.second.viewClass
+            }
+            .mapNotNull { (_, group) ->
+                group.maxByOrNull {
+                    it.first.sharpness
+                }
+            }
+            .sortedBy {
+                it.first.timestampMs
+            }
 
-        val dedupedCount = kept.size - bestPerView.size
+        val dedupedCount =
+            kept.size - bestPerView.size
 
         val entries = bestPerView.map { (frame, result) ->
             ManifestEntry(
@@ -148,7 +252,7 @@ object PipelineRunner {
             )
         }
 
-        onStage("Building manifest")
+        onStage("Building input manifest")
 
         return InputManifest(
             videoPresent = videoUri != null,
@@ -156,21 +260,31 @@ object PipelineRunner {
             framesRejected = rejectedCount,
             framesDeduped = dedupedCount,
             selected = entries,
+
             dashboardPresent = dashboardUri != null,
             dashboardSharpness = dashboardSharpness,
             dashboardUsable = dashboardUsable,
             dashboardClass = dashboardClass,
             dashboardConfidence = dashboardConfidence,
+
             tyrePresent = tyreUri != null,
             obdPresent = obdPresent,
+
             classifierName = engine.name,
-            backendUsed = clip?.backend?.name ?: "NONE",
+            backendUsed =
+                if (mobileNet != null) {
+                    "CPU_XNNPACK"
+                } else {
+                    "HEURISTIC"
+                },
             backendRequested = backend?.name ?: "AUTO",
-            backendUnavailable = requestedButUnavailable,
+            backendUnavailable = false,
             loadError = loadError,
+
             inferenceCount = inferenceCount,
             inferenceMs = inferenceMs,
-            elapsedMs = SystemClock.elapsedRealtime() - startedAt
+            elapsedMs =
+                SystemClock.elapsedRealtime() - startedAt
         )
     }
 }
